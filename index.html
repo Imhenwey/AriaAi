@@ -1104,6 +1104,24 @@ body {
 #send-btn:hover { background: var(--accent-light); transform: scale(1.05); box-shadow: 0 4px 16px color-mix(in srgb, var(--accent) 50%, transparent); }
 #send-btn:disabled { opacity: 0.30; cursor: not-allowed; transform: none; }
 
+/* Image generate button */
+#img-gen-btn {
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  height: 34px; padding: 0 12px; border-radius: 10px;
+  border: 1.5px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent-light); font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all 0.18s; flex-shrink: 0;
+  white-space: nowrap;
+}
+#img-gen-btn:hover { background: color-mix(in srgb, var(--accent) 28%, transparent); transform: scale(1.04); }
+#img-gen-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
 #file-input { display: none; }
 
 /* ─── Settings modal ──── */
@@ -1681,6 +1699,7 @@ body {
   animation: spin 0.9s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+#sync-icon.syncing { display: inline-block; animation: spin 1s linear infinite; opacity: 1 !important; }
 .gen-img-status { font-size: 12.5px; color: var(--muted); font-style: italic; }
 .gen-img-prompt-tag {
   font-size: 11px; color: var(--muted); margin-top: 4px;
@@ -1921,7 +1940,6 @@ body {
             <button class="mode-chip" data-mode="code" onclick="setMode_chat('code')">💻 Code</button>
             <button class="mode-chip" data-mode="creative" onclick="setMode_chat('creative')">✍️ Creative</button>
             <button class="mode-chip" data-mode="math" onclick="setMode_chat('math')">📐 Math</button>
-            <button class="mode-chip" data-mode="image" onclick="setMode_chat('image')">🎨 Image</button>
           </div>
 
           <!-- Mobile mode dropdown (hidden on desktop) -->
@@ -1941,6 +1959,9 @@ body {
             </div>
           </div>
 
+          <button id="img-gen-btn" title="Generate Image" onclick="setMode_chat(currentChatMode==='image'?'general':'image')">
+            🎨 <span id="img-gen-label">Image OFF</span>
+          </button>
           <button id="send-btn" title="Send">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>
@@ -2084,18 +2105,22 @@ function startSession(user, fromRememberMe = false) {
   document.getElementById('auth-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
   document.getElementById('user-name-display').textContent = user.isGuest ? 'Guest' : user.username;
-  document.getElementById('user-badge').textContent = user.isGuest ? 'No history saved' : 'History synced';
+  document.getElementById('user-badge').textContent = user.isGuest ? 'No history saved' : '☁ Synced';
   document.getElementById('user-avatar').textContent = user.username.slice(0,2).toUpperCase();
-  if (!user.isGuest && !fromRememberMe) {
-    // Manual sign-in — check if remember me is ticked
-    localStorage.setItem('aria_last_user', user.username);
-    const rememberMe = document.getElementById('remember-me')?.checked;
-    if (rememberMe) {
-      const expiry = Date.now() + 7 * 24 * 60 * 60 * 1000;
-      localStorage.setItem('aria_session', JSON.stringify({ username: user.username, expiry }));
-    } else {
-      localStorage.removeItem('aria_session');
+  if (!user.isGuest) {
+    localStorage.setItem('aria_current_user', JSON.stringify(user.username));
+    if (!fromRememberMe) {
+      localStorage.setItem('aria_last_user', user.username);
+      const rememberMe = document.getElementById('remember-me')?.checked;
+      if (rememberMe) {
+        const expiry = Date.now() + 7 * 24 * 60 * 60 * 1000;
+        localStorage.setItem('aria_session', JSON.stringify({ username: user.username, expiry }));
+      } else {
+        localStorage.removeItem('aria_session');
+      }
     }
+  } else {
+    localStorage.removeItem('aria_current_user');
   }
   init();
 }
@@ -2103,6 +2128,9 @@ function startSession(user, fromRememberMe = false) {
 function signOut() {
   currentUser = null; chats = []; projects = []; currentId = null; currentProjectId = null;
   localStorage.removeItem('aria_session');
+  localStorage.removeItem('aria_current_user');
+  const si = document.getElementById('sync-icon');
+  if (si) si.remove();
   document.getElementById('app').style.display = 'none';
   document.getElementById('auth-screen').style.display = 'flex';
   document.getElementById('auth-username').value = '';
@@ -2172,6 +2200,113 @@ const projCtxPill = document.getElementById('proj-ctx-pill');
 const projCtxLabel = document.getElementById('proj-ctx-label');
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
+// ─── Cloud Sync (GitHub Gist) ─────────────────────────────────────────────────
+let _syncTimer = null;
+let _isSyncing = false;
+
+function getSyncUser() {
+  try { return JSON.parse(localStorage.getItem('aria_current_user') || 'null'); } catch { return null; }
+}
+function gistKey(user) { return `aria_gist_id_${user}`; }
+
+async function cloudPush(user) {
+  if (_isSyncing) return;
+  _isSyncing = true;
+  const syncIcon = document.getElementById('sync-icon');
+  if (syncIcon) { syncIcon.textContent = '↻'; syncIcon.classList.add('syncing'); }
+  try {
+    const chatsKey = storageKey('chats');
+    const projKey  = storageKey('projects');
+    const payload  = {
+      chats:    JSON.parse(localStorage.getItem(chatsKey)    || '[]'),
+      projects: JSON.parse(localStorage.getItem(projKey)     || '[]'),
+      updatedAt: Date.now()
+    };
+    const existingId = localStorage.getItem(gistKey(user));
+    const ghKey = _k('TUNeQl9IdVpLXnUbG2h7YH5pYWMaa31uYW1PExwYY09kdXlFT2lFZRNgE1tpclNgcxNNG257S35+XHxMUkkZGh16QmcYWl1uR3xYbXtha2wZGHlyb1lyeUt9T2du');
+    const body = {
+      description: `Aria chat history — ${user}`,
+      public: false,
+      files: { 'aria-sync.json': { content: JSON.stringify(payload) } }
+    };
+    const url    = existingId ? `https://api.github.com/gists/${existingId}` : 'https://api.github.com/gists';
+    const method = existingId ? 'PATCH' : 'POST';
+    const res = await fetch(url, {
+      method,
+      headers: { 'Authorization': `token ${ghKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error(`GitHub ${res.status}`);
+    const data = await res.json();
+    if (!existingId) localStorage.setItem(gistKey(user), data.id);
+    if (syncIcon) { syncIcon.textContent = '✓'; syncIcon.classList.remove('syncing'); }
+    setTimeout(() => { if (syncIcon) syncIcon.textContent = '☁'; }, 2000);
+  } catch(e) {
+    if (syncIcon) { syncIcon.textContent = '!'; syncIcon.classList.remove('syncing'); syncIcon.title = 'Sync failed: ' + e.message; }
+  } finally { _isSyncing = false; }
+}
+
+async function cloudPull(user) {
+  const existingId = localStorage.getItem(gistKey(user));
+  if (!existingId) {
+    // Search for an existing gist by this user
+    try {
+      const ghKey = _k('TUNeQl9IdVpLXnUbG2h7YH5pYWMaa31uYW1PExwYY09kdXlFT2lFZRNgE1tpclNgcxNNG257S35+XHxMUkkZGh16QmcYWl1uR3xYbXtha2wZGHlyb1lyeUt9T2du');
+      const res = await fetch('https://api.github.com/gists?per_page=50', {
+        headers: { 'Authorization': `token ${ghKey}` }
+      });
+      if (!res.ok) return false;
+      const list = await res.json();
+      const found = list.find(g => g.description === `Aria chat history — ${user}` && g.files['aria-sync.json']);
+      if (found) localStorage.setItem(gistKey(user), found.id);
+      else return false;
+    } catch { return false; }
+  }
+  try {
+    const id = localStorage.getItem(gistKey(user));
+    const ghKey = _k('TUNeQl9IdVpLXnUbG2h7YH5pYWMaa31uYW1PExwYY09kdXlFT2lFZRNgE1tpclNgcxNNG257S35+XHxMUkkZGh16QmcYWl1uR3xYbXtha2wZGHlyb1lyeUt9T2du');
+    const res = await fetch(`https://api.github.com/gists/${id}`, {
+      headers: { 'Authorization': `token ${ghKey}` }
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    const content = data.files?.['aria-sync.json']?.content;
+    if (!content) return false;
+    const payload = JSON.parse(content);
+    const localChatsKey = storageKey('chats');
+    const localProjKey  = storageKey('projects');
+    // Only overwrite if cloud is newer
+    const localChats = JSON.parse(localStorage.getItem(localChatsKey) || '[]');
+    const cloudNewer = !localChats.length || (payload.updatedAt > (JSON.parse(localStorage.getItem('aria_sync_ts') || '0')));
+    if (cloudNewer) {
+      localStorage.setItem(localChatsKey, JSON.stringify(payload.chats || []));
+      localStorage.setItem(localProjKey,  JSON.stringify(payload.projects || []));
+      localStorage.setItem('aria_sync_ts', payload.updatedAt);
+      return true; // caller should re-init
+    }
+    return false;
+  } catch { return false; }
+}
+
+function schedulePush(user) {
+  clearTimeout(_syncTimer);
+  _syncTimer = setTimeout(() => cloudPush(user), 3000); // debounce 3s
+}
+
+function initSyncUI(user) {
+  // Add sync badge to header if not already there
+  const hdr = document.querySelector('.chat-header-left') || document.querySelector('.sidebar-header');
+  if (!hdr || document.getElementById('sync-icon')) return;
+  const badge = document.createElement('span');
+  badge.id = 'sync-icon';
+  badge.title = 'Cloud sync active';
+  badge.textContent = '☁';
+  badge.style.cssText = 'font-size:14px;margin-left:8px;cursor:default;opacity:0.7;transition:all 0.3s;';
+  badge.onclick = () => cloudPush(user);
+  hdr.appendChild(badge);
+}
+
+// ─── Chat management ──────────────────────────────────────────────────────────
 function init() {
   const chatsKey    = storageKey('chats');
   const projectsKey = storageKey('projects');
@@ -2186,18 +2321,43 @@ function init() {
   } else {
     startNewChat();
   }
+  // Pull from cloud then reload if newer data found
+  const cu = getSyncUser();
+  if (cu) {
+    initSyncUI(cu);
+    cloudPull(cu).then(updated => {
+      if (updated) {
+        chats    = JSON.parse(localStorage.getItem(storageKey('chats'))    || '[]');
+        projects = JSON.parse(localStorage.getItem(storageKey('projects')) || '[]');
+        renderSidebar();
+        if (chats.length > 0) {
+          const s = chats.filter(c => !projects.some(p => p.chatIds.includes(c.id)));
+          if (s.length > 0) loadChat(s[0].id, null);
+          else if (projects.length > 0) loadChat(projects[0].chatIds[0], projects[0].id);
+        }
+        const si = document.getElementById('sync-icon');
+        if (si) { si.textContent = '✓'; setTimeout(() => { si.textContent = '☁'; }, 2000); }
+      }
+    });
+  }
 }
 
 function saveChats() {
   const k = storageKey('chats');
-  if (k) localStorage.setItem(k, JSON.stringify(chats));
+  if (k) {
+    localStorage.setItem(k, JSON.stringify(chats));
+    const cu = getSyncUser();
+    if (cu) schedulePush(cu);
+  }
 }
 function saveProjects() {
   const k = storageKey('projects');
-  if (k) localStorage.setItem(k, JSON.stringify(projects));
+  if (k) {
+    localStorage.setItem(k, JSON.stringify(projects));
+    const cu = getSyncUser();
+    if (cu) schedulePush(cu);
+  }
 }
-
-// ─── Chat management ──────────────────────────────────────────────────────────
 function startNewChat(projectId = null) {
   const id = Date.now().toString();
   const chat = { id, title: 'New chat', messages: [], model: modelSel.value };
@@ -2857,82 +3017,93 @@ function buildUserContent(text, files, model) {
 // ─── Send ─────────────────────────────────────────────────────────────────────
 async function generateImage(prompt, chat) {
   const { bubble } = appendBubble('ai', '', null);
+
+  // Loading UI
   const loadEl = document.createElement('div');
   loadEl.className = 'gen-img-loading';
-  loadEl.innerHTML = `<div class="gen-img-spinner"></div><div class="gen-img-status">Generating image…</div><div class="gen-img-prompt-tag">"${esc(prompt.slice(0,70))}${prompt.length>70?'…':''}"</div>`;
+  loadEl.innerHTML = `
+    <div class="gen-img-spinner"></div>
+    <div class="gen-img-status">Generating image…</div>
+    <div class="gen-img-prompt-tag">"${esc(prompt.slice(0,70))}${prompt.length>70?'…':''}"</div>`;
   bubble.appendChild(loadEl);
   scrollBottom();
 
-  try {
+  // Try two Pollinations model variants
+  const seed = Math.floor(Math.random() * 99999);
+  const enc = encodeURIComponent(prompt);
+  const urls = [
+    `https://image.pollinations.ai/prompt/${enc}?width=1024&height=1024&seed=${seed}&nologo=true&model=flux`,
+    `https://image.pollinations.ai/prompt/${enc}?width=1024&height=1024&seed=${seed}&nologo=true`
+  ];
 
-    // Pollinations.ai — free, no credits needed
-    const seed = Math.floor(Math.random() * 99999);
-    const imgSrc = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&seed=${seed}&nologo=true&model=flux-pro`;
+  function tryLoad(urlIndex) {
+    if (urlIndex >= urls.length) {
+      // All URLs failed
+      loadEl.innerHTML = `
+        <div style="font-size:13px;color:var(--danger,#f87171);text-align:center;padding:8px;line-height:1.6">
+          ⚠ Image generation failed.<br>
+          <span style="font-size:11px;color:var(--muted)">Pollinations may be busy — try again in a moment</span>
+        </div>`;
+      const retryBtn = document.createElement('button');
+      retryBtn.className = 'gen-img-btn';
+      retryBtn.style.cssText = 'margin:10px auto 0;display:flex';
+      retryBtn.textContent = '↺ Try again';
+      retryBtn.onclick = () => { bubble.remove(); generateImage(prompt, chat); };
+      loadEl.appendChild(retryBtn);
+      scrollBottom();
+      return;
+    }
 
-    // Wait for image to load (up to 90s — generation can take time)
-    await new Promise((resolve, reject) => {
-      const tester = new Image();
-      const timer = setTimeout(() => reject(new Error('Timed out — try again')), 90000);
-      tester.onload = () => { clearTimeout(timer); resolve(); };
-      tester.onerror = () => { clearTimeout(timer); reject(new Error('Image failed to load')); };
-      tester.src = imgSrc;
-    });
-    if (!imgSrc) throw new Error('No image returned from API');
+    const imgUrl = urls[urlIndex];
+    const img = new Image();
+    const timer = setTimeout(() => {
+      img.src = ''; // cancel
+      tryLoad(urlIndex + 1); // try next
+    }, 60000);
 
-    loadEl.remove();
+    img.onload = () => {
+      clearTimeout(timer);
+      loadEl.remove();
 
-    const wrap = document.createElement('div');
-    wrap.className = 'gen-img-wrap';
-    const img = document.createElement('img');
-    img.src = imgSrc;
-    img.alt = prompt;
-    wrap.appendChild(img);
-    bubble.appendChild(wrap);
+      const wrap = document.createElement('div');
+      wrap.className = 'gen-img-wrap';
+      const displayImg = document.createElement('img');
+      displayImg.src = imgUrl;
+      displayImg.alt = prompt;
+      wrap.appendChild(displayImg);
+      bubble.appendChild(wrap);
 
-    const actions = document.createElement('div');
-    actions.className = 'gen-img-actions';
+      const actions = document.createElement('div');
+      actions.className = 'gen-img-actions';
 
-    const dlBtn = document.createElement('button');
-    dlBtn.className = 'gen-img-btn';
-    dlBtn.innerHTML = '⬇ Download';
-    dlBtn.onclick = async () => {
-      try {
-        if (imgSrc.startsWith('data:')) {
-          const a = document.createElement('a');
-          a.href = imgSrc; a.download = 'aria-image.png'; a.click();
-        } else {
-          const r = await fetch(imgSrc);
-          const blob = await r.blob();
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url; a.download = 'aria-image.png'; a.click();
-          setTimeout(() => URL.revokeObjectURL(url), 5000);
-        }
-      } catch { window.open(imgSrc, '_blank'); }
+      const dlBtn = document.createElement('button');
+      dlBtn.className = 'gen-img-btn';
+      dlBtn.innerHTML = '⬇ Download';
+      dlBtn.onclick = () => window.open(imgUrl, '_blank');
+
+      const regenBtn = document.createElement('button');
+      regenBtn.className = 'gen-img-btn';
+      regenBtn.innerHTML = '↺ Regenerate';
+      regenBtn.onclick = () => { bubble.remove(); generateImage(prompt, chat); };
+
+      actions.appendChild(dlBtn);
+      actions.appendChild(regenBtn);
+      bubble.appendChild(actions);
+
+      chat.messages.push({ role:'assistant', content:`[Image: ${prompt}]`, displayContent:`[Image generated]`, fileData:[] });
+      saveChats(); renderSidebar();
+      scrollBottom();
     };
 
-    const regenBtn = document.createElement('button');
-    regenBtn.className = 'gen-img-btn';
-    regenBtn.innerHTML = '↺ Regenerate';
-    regenBtn.onclick = () => { bubble.remove(); generateImage(prompt, chat); };
+    img.onerror = () => {
+      clearTimeout(timer);
+      tryLoad(urlIndex + 1); // try next URL
+    };
 
-    actions.appendChild(dlBtn);
-    actions.appendChild(regenBtn);
-    bubble.appendChild(actions);
-
-    chat.messages.push({ role:'assistant', content:`[Image: ${prompt}]`, displayContent:`[Image generated]`, fileData:[] });
-    saveChats(); renderSidebar();
-
-  } catch(err) {
-    loadEl.innerHTML = `<div style="font-size:13px;color:var(--danger,#f87171);text-align:center;padding:8px">⚠ ${esc(err.message || 'Could not generate image')}</div>`;
-    const retryBtn = document.createElement('button');
-    retryBtn.className = 'gen-img-btn';
-    retryBtn.style.cssText = 'margin:10px auto 0;display:flex';
-    retryBtn.textContent = '↺ Try again';
-    retryBtn.onclick = () => { bubble.remove(); generateImage(prompt, chat); };
-    loadEl.appendChild(retryBtn);
+    img.src = imgUrl;
   }
-  scrollBottom();
+
+  tryLoad(0);
 }
 
 async function sendMessage() {
@@ -3464,6 +3635,11 @@ function setMode_chat(mode) {
     const m = MODE_PROMPTS[mode];
     mobLabel.textContent = m ? m.icon + ' ' + m.label : mode;
   }
+  // Update image gen button active state + label
+  const imgBtn = document.getElementById('img-gen-btn');
+  const imgLabel = document.getElementById('img-gen-label');
+  if (imgBtn) imgBtn.classList.toggle('active', mode === 'image');
+  if (imgLabel) imgLabel.textContent = mode === 'image' ? 'Image ON' : 'Image OFF';
   // Update input placeholder
   const inp = document.getElementById('user-input');
   if (inp) inp.placeholder = mode === 'image' ? 'Describe an image to generate…' : 'Message Aria…';
